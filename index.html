@@ -1042,6 +1042,86 @@
       return changed;
     }
 
+    // --- Auto-load every mp3 sitting in the GitHub repo's /songs folder ---
+    // This lets the playlist stay in sync with the songs folder automatically:
+    // just drag mp3 files in/out of that folder on GitHub, no code edits needed.
+
+    function isGithubPagesHost() {
+      return /\.github\.io$/i.test(location.hostname);
+    }
+
+    function githubRepoInfo() {
+      const owner = location.hostname.split(".")[0];
+      const segments = location.pathname.split("/").filter(Boolean);
+      const repo = segments.length ? segments[0] : (owner + ".github.io");
+      return { owner, repo };
+    }
+
+    function fetchByteRange(url, start, end) {
+      return fetch(url, { headers: { Range: "bytes=" + start + "-" + end } }).then((res) => {
+        if (!res.ok && res.status !== 206) throw new Error("range fetch failed: " + res.status);
+        return res.arrayBuffer();
+      });
+    }
+
+    // Same idea as readId3FromFile, but for a remote URL: fetch just the ID3
+    // header bytes first, then only the tag's own size, instead of downloading
+    // the whole (full-quality, possibly multi-MB) audio file just for tags.
+    function readId3FromUrl(url) {
+      return fetchByteRange(url, 0, 9).then((headerBuf) => {
+        const header = new Uint8Array(headerBuf);
+        if (header.length < 10 || header[0] !== 0x49 || header[1] !== 0x44 || header[2] !== 0x33) return null;
+        const tagSize = ((header[6] & 0x7f) << 21) | ((header[7] & 0x7f) << 14) | ((header[8] & 0x7f) << 7) | (header[9] & 0x7f);
+        return fetchByteRange(url, 0, 9 + tagSize).then((buf) => parseId3Tags(buf));
+      }).catch(() => null);
+    }
+
+    function loadFromGithubFolder(folder) {
+      if (!isGithubPagesHost()) return Promise.resolve(false);
+      const { owner, repo } = githubRepoInfo();
+      const apiUrl = "https://api.github.com/repos/" + owner + "/" + repo + "/contents/" + folder;
+
+      return fetch(apiUrl, { headers: { Accept: "application/vnd.github+json" } })
+        .then((res) => {
+          if (!res.ok) throw new Error("github api " + res.status);
+          return res.json();
+        })
+        .then((items) => {
+          const audioItems = (Array.isArray(items) ? items : [])
+            .filter((it) => it.type === "file" && /\.(mp3|wav|m4a|ogg|flac|aac)$/i.test(it.name))
+            .sort((a, b) => a.name.localeCompare(b.name, "en"));
+          if (!audioItems.length) return false;
+
+          audioItems.forEach((item) => {
+            const url = folder + "/" + encodeURIComponent(item.name);
+            const track = { id: nextId++, name: item.name, title: null, url, duration: null, lyrics: null, cover: null };
+            tracks.push(track);
+
+            const probe = new Audio();
+            probe.preload = "metadata";
+            probe.src = url;
+            probe.addEventListener("loadedmetadata", () => {
+              track.duration = probe.duration;
+              renderPlaylist();
+            }, { once: true });
+
+            readId3FromUrl(url).then((meta) => {
+              if (applyId3Meta(track, meta)) {
+                renderPlaylist();
+                if (track.id === currentId) renderNowPlayingMeta(track);
+              }
+            });
+          });
+
+          renderPlaylist();
+          if (currentId === null && tracks.length) {
+            loadTrack(tracks[0].id, { autoplay: false });
+          }
+          return true;
+        })
+        .catch(() => false);
+    }
+
     function addFiles(fileList) {
       const files = Array.from(fileList).filter(isAudioFile);
       if (!files.length) return;
@@ -1389,23 +1469,27 @@
     audio.addEventListener("pause", () => { setPlayingUI(false); renderPlaylist(); });
     audio.addEventListener("ended", () => goNext(true));
 
-    if (PRESET_TRACKS.length) {
-      PRESET_TRACKS.forEach((p) => {
-        tracks.push({
-          id: nextId++,
-          name: p.name,
-          title: p.title || null,
-          url: p.data ? ("data:" + p.mime + ";base64," + p.data) : p.src,
-          duration: p.duration,
-          lyrics: p.lyrics || null,
-          cover: p.cover || null,
+    loadFromGithubFolder("songs").then((loadedFromGithub) => {
+      if (loadedFromGithub) return;
+
+      if (PRESET_TRACKS.length) {
+        PRESET_TRACKS.forEach((p) => {
+          tracks.push({
+            id: nextId++,
+            name: p.name,
+            title: p.title || null,
+            url: p.data ? ("data:" + p.mime + ";base64," + p.data) : p.src,
+            duration: p.duration,
+            lyrics: p.lyrics || null,
+            cover: p.cover || null,
+          });
         });
-      });
-      loadTrack(tracks[0].id, { autoplay: false });
-      renderPlaylist();
-    } else {
-      updateLcdEmpty();
-    }
+        loadTrack(tracks[0].id, { autoplay: false });
+        renderPlaylist();
+      } else {
+        updateLcdEmpty();
+      }
+    });
   })();
 </script>
 
